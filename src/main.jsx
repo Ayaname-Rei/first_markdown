@@ -113,23 +113,9 @@ const CODE_BLOCK_LANGUAGES = [
 ];
 
 const desktop = typeof window !== 'undefined' ? window.inkspace : undefined;
-const SIDEBAR_PREVIEW_CACHE_LIMIT = 24;
-const SIDEBAR_PREVIEW_CONTENT_LIMIT = 3200;
 
 function classNames(...values) {
   return values.filter(Boolean).join(' ');
-}
-
-function rememberSidebarPreview(cache, preview) {
-  cache.delete(preview.relativePath);
-  cache.set(preview.relativePath, preview);
-  while (cache.size > SIDEBAR_PREVIEW_CACHE_LIMIT) {
-    cache.delete(cache.keys().next().value);
-  }
-}
-
-function sidebarPreviewExcerpt(content) {
-  return String(content || '').slice(0, SIDEBAR_PREVIEW_CONTENT_LIMIT);
 }
 
 function fileStem(relativePath) {
@@ -340,17 +326,19 @@ function App() {
   const [editorTick, setEditorTick] = useState(0);
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState('');
-  const [sidebarPreview, setSidebarPreview] = useState(null);
-
   const vaultRef = useRef(vault);
   const documentRef = useRef(activeDocument);
   const applyingContentRef = useRef(false);
   const saveTimerRef = useRef();
+  const saveChainRef = useRef(Promise.resolve());
   const linkSelectionRef = useRef(null);
   const titleInputRef = useRef(null);
-  const sidebarPreviewCacheRef = useRef(new Map());
-  const sidebarPreviewRequestRef = useRef(0);
   const ignoreEditorUpdateRef = useRef(false);
+  const openRequestChainRef = useRef(Promise.resolve());
+  const closingRef = useRef(false);
+  const fileDialogOpenRef = useRef(false);
+  const vaultDialogOpenRef = useRef(false);
+  const saveAsActiveRef = useRef(false);
 
   const activeMarkdown = activeDocument?.content || '';
   const deferredMarkdown = useDeferredValue(activeMarkdown);
@@ -361,7 +349,6 @@ function App() {
   const words = useMemo(() => countWords(deferredMarkdown), [deferredMarkdown]);
   const visibleTree = useMemo(() => filterTree(vault?.tree, searchQuery.trim()), [vault, searchQuery]);
   const activePageNode = useMemo(() => findTreeNode(vault?.tree, activeDocument?.relativePath), [vault, activeDocument?.relativePath]);
-  const sidebarPreviewMarkdown = sidebarPreview?.content?.slice(0, 2600) || '';
   const filteredSlashCommands = useMemo(
     () => SLASH_COMMANDS.filter((item) => `${item.id} ${item.label} ${item.detail}`.toLowerCase().includes(slashQuery)),
     [slashQuery],
@@ -485,19 +472,47 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  useEffect(() => () => window.clearTimeout(saveTimerRef.current), []);
+  useEffect(() => () => {
+    window.clearTimeout(saveTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (!desktop?.onCommand) return undefined;
-    return desktop.onCommand((command) => {
+    return desktop.onCommand((command, payload) => {
+      if (command === 'open-file') openFile();
       if (command === 'open-folder') openVault();
       if (command === 'new-note') openNameDialog('new-file', selectedFolder || parentPath(documentRef.current?.relativePath));
       if (command === 'new-folder') openNameDialog('new-folder', selectedFolder || parentPath(documentRef.current?.relativePath));
+      if (command === 'save') saveCurrentDocument();
+      if (command === 'save-as') saveDocumentAs();
+      if (command === 'reveal-active-document') revealActiveDocument();
       if (command === 'export-markdown') exportActiveDocument('md');
       if (command === 'export-html') exportActiveDocument('html');
       if (command === 'export-pdf') exportActiveDocument('pdf');
+      if (command === 'open-default-app-settings') openDefaultAppSettings();
+      if (command === 'open-document-error') setToast(payload || '无法打开此 Markdown 文件。');
     });
   }, [vault, selectedFolder]);
+
+  useEffect(() => {
+    if (!desktop?.onOpenDocument) return undefined;
+    return desktop.onOpenDocument((request) => {
+      openRequestChainRef.current = openRequestChainRef.current
+        .catch(() => undefined)
+        .then(() => activateOpenedDocument(request));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!desktop?.onRequestClose) return undefined;
+    return desktop.onRequestClose(() => {
+      void finishCloseRequest();
+    });
+  }, []);
+
+  useEffect(() => {
+    if (desktop?.signalReady) desktop.signalReady();
+  }, []);
 
   useEffect(() => {
     const handleShortcut = (event) => {
@@ -506,6 +521,17 @@ function App() {
         event.preventDefault();
         setCommandOpen(true);
         setCommandQuery('');
+      }
+      if (modifier && event.key.toLowerCase() === 'o') {
+        event.preventDefault();
+        if (event.shiftKey) openVault();
+        else openFile();
+        return;
+      }
+      if (modifier && event.shiftKey && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        saveDocumentAs();
+        return;
       }
       if (modifier && event.key.toLowerCase() === 's') {
         event.preventDefault();
@@ -530,32 +556,39 @@ function App() {
   }
 
   async function persistDocument(rootPath, relativePath, content, viewOverrides = {}) {
-    if (!desktop?.writeDocument) return;
-    try {
-      setSaveState('saving');
-      const result = await desktop.writeDocument(rootPath, relativePath, writeDocumentView(content, viewOverrides));
-      const current = documentRef.current;
-      if (current?.relativePath === relativePath && current.content === content && JSON.stringify(current.viewOverrides || {}) === JSON.stringify(normalizeViewOverrides(viewOverrides))) {
-        const saved = { ...current, dirty: false, modifiedAt: result.modifiedAt, size: result.size };
-        const previewContent = sidebarPreviewExcerpt(content);
-        rememberSidebarPreview(sidebarPreviewCacheRef.current, { relativePath, title: fileStem(relativePath), content: previewContent, modifiedAt: result.modifiedAt, size: result.size });
-        setSidebarPreview((previous) => previous?.relativePath === relativePath ? { ...previous, content: previewContent, modifiedAt: result.modifiedAt, size: result.size, loading: false } : previous);
-        documentRef.current = saved;
-        setActiveDocument(saved);
-        setSaveState('saved');
+    if (!desktop?.writeDocument) return false;
+    const operation = saveChainRef.current.then(async () => {
+      try {
+        setSaveState('saving');
+        const result = await desktop.writeDocument(rootPath, relativePath, writeDocumentView(content, viewOverrides));
+        const current = documentRef.current;
+        if (vaultRef.current?.rootPath === rootPath && current?.relativePath === relativePath && current.content === content && JSON.stringify(current.viewOverrides || {}) === JSON.stringify(normalizeViewOverrides(viewOverrides))) {
+          const saved = { ...current, dirty: false, modifiedAt: result.modifiedAt, size: result.size };
+          documentRef.current = saved;
+          setActiveDocument(saved);
+          setSaveState('saved');
+        }
+        return true;
+      } catch (error) {
+        setSaveState('error');
+        setToast(error.message || 'Could not save this file.');
+        return false;
       }
-    } catch (error) {
-      setSaveState('error');
-      setToast(error.message || 'Could not save this file.');
-    }
+    });
+    saveChainRef.current = operation.catch(() => false);
+    return operation;
   }
 
   async function saveCurrentDocument() {
     const current = documentRef.current;
     const currentVault = vaultRef.current;
-    if (!current || !currentVault) return;
+    if (!current || !currentVault) return true;
     window.clearTimeout(saveTimerRef.current);
-    await persistDocument(currentVault.rootPath, current.relativePath, current.content, current.viewOverrides);
+    return persistDocument(currentVault.rootPath, current.relativePath, current.content, current.viewOverrides);
+  }
+
+  async function flushPendingDocument() {
+    return documentRef.current?.dirty ? saveCurrentDocument() : true;
   }
 
   async function refreshVault() {
@@ -563,8 +596,6 @@ function App() {
     if (!currentVault || !desktop?.listVault) return;
     try {
       const next = await desktop.listVault(currentVault.rootPath);
-      sidebarPreviewCacheRef.current.clear();
-      sidebarPreviewRequestRef.current += 1;
       setVault(next);
     } catch (error) {
       setToast(error.message || 'Could not refresh the folder.');
@@ -573,41 +604,54 @@ function App() {
 
   async function openVault() {
     if (!desktop?.selectVault) return;
+    if (vaultDialogOpenRef.current) return;
+    vaultDialogOpenRef.current = true;
     try {
       const next = await desktop.selectVault();
       if (!next) return;
+      if (!(await flushPendingDocument())) return;
       setVault(next);
+      vaultRef.current = next;
       setSelectedFolder('');
       setExpandedFolders(new Set(['']));
       const firstFile = findFirstFile(next.tree);
-      if (firstFile) await openDocument(firstFile.relativePath, next);
+      if (firstFile) await openDocument(firstFile.relativePath, next, { skipSave: true });
       else {
+        documentRef.current = null;
         setActiveDocument(null);
         setTitleDraft('');
       }
     } catch (error) {
       setToast(error.message || 'Could not open this folder.');
+    } finally {
+      vaultDialogOpenRef.current = false;
     }
   }
 
   async function openRecentVault(rootPath) {
     try {
       const next = await desktop.openRecentVault(rootPath);
+      if (!(await flushPendingDocument())) return;
       setVault(next);
+      vaultRef.current = next;
       setSelectedFolder('');
       setExpandedFolders(new Set(['']));
       const firstFile = findFirstFile(next.tree);
-      if (firstFile) await openDocument(firstFile.relativePath, next);
-      else setActiveDocument(null);
+      if (firstFile) await openDocument(firstFile.relativePath, next, { skipSave: true });
+      else {
+        documentRef.current = null;
+        setActiveDocument(null);
+        setTitleDraft('');
+      }
     } catch (error) {
       setToast(error.message || 'This folder is no longer available.');
     }
   }
 
-  async function openDocument(relativePath, sourceVault = vaultRef.current) {
-    if (!sourceVault || !desktop?.readDocument) return;
+  async function openDocument(relativePath, sourceVault = vaultRef.current, options = {}) {
+    if (!sourceVault || !desktop?.readDocument) return false;
     const current = documentRef.current;
-    if (current?.dirty) await saveCurrentDocument();
+    if (!options.skipSave && current?.dirty && !(await flushPendingDocument())) return false;
     try {
       setSaveState('loading');
       const payload = await desktop.readDocument(sourceVault.rootPath, relativePath);
@@ -620,39 +664,39 @@ function App() {
       setSelectedFolder(parentPath(relativePath));
       setSaveState('saved');
       setNodeMenu(null);
+      return true;
     } catch (error) {
       setSaveState('error');
       setToast(error.message || 'Could not read this file.');
+      return false;
     }
   }
 
-  async function previewSidebarPage(node) {
-    const currentVault = vaultRef.current;
-    if (!node || node.kind !== 'file' || !currentVault || !desktop?.readDocument) return;
-    const active = documentRef.current;
-    if (active?.relativePath === node.relativePath) {
-      setSidebarPreview({ relativePath: node.relativePath, title: fileStem(node.name), content: sidebarPreviewExcerpt(active.content), modifiedAt: active.modifiedAt, size: active.size, loading: false });
-      return;
-    }
+  async function activateOpenedDocument(request, options = {}) {
+    if (!request?.vault?.rootPath || !request?.relativePath) return false;
+    if (!options.skipSave && !(await flushPendingDocument())) return false;
 
-    const cached = sidebarPreviewCacheRef.current.get(node.relativePath);
-    if (cached) {
-      rememberSidebarPreview(sidebarPreviewCacheRef.current, cached);
-      setSidebarPreview({ ...cached, loading: false });
-      return;
-    }
+    const nextVault = request.vault;
+    setVault(nextVault);
+    vaultRef.current = nextVault;
+    setSearchQuery('');
+    setSelectedFolder('');
+    setExpandedFolders(new Set(['']));
+    return openDocument(request.relativePath, nextVault, { skipSave: true });
+  }
 
-    const requestId = sidebarPreviewRequestRef.current + 1;
-    sidebarPreviewRequestRef.current = requestId;
-    setSidebarPreview({ relativePath: node.relativePath, title: fileStem(node.name), content: '', loading: true });
+  async function openFile() {
+    if (!desktop?.selectDocument) return;
+    if (fileDialogOpenRef.current) return;
+    fileDialogOpenRef.current = true;
     try {
-      const payload = await desktop.readDocument(currentVault.rootPath, node.relativePath);
-      const parsed = readDocumentView(payload.content);
-      const preview = { relativePath: node.relativePath, title: fileStem(node.name), content: sidebarPreviewExcerpt(parsed.content), modifiedAt: payload.modifiedAt, size: payload.size };
-      rememberSidebarPreview(sidebarPreviewCacheRef.current, preview);
-      if (sidebarPreviewRequestRef.current === requestId) setSidebarPreview({ ...preview, loading: false });
-    } catch {
-      if (sidebarPreviewRequestRef.current === requestId) setSidebarPreview(null);
+      const request = await desktop.selectDocument();
+      if (!request) return;
+      await activateOpenedDocument(request);
+    } catch (error) {
+      setToast(error.message || '无法打开此 Markdown 文件。');
+    } finally {
+      fileDialogOpenRef.current = false;
     }
   }
 
@@ -811,6 +855,69 @@ function App() {
     }
   }
 
+  async function saveDocumentAs() {
+    if (saveAsActiveRef.current || !desktop?.saveDocumentAs) return;
+    saveAsActiveRef.current = true;
+
+    window.clearTimeout(saveTimerRef.current);
+    try {
+      if (!(await flushPendingDocument())) return;
+      const current = documentRef.current;
+      const currentVault = vaultRef.current;
+      if (!current || !currentVault) return;
+      setSaveState('saving');
+      const request = await desktop.saveDocumentAs(
+        currentVault.rootPath,
+        current.relativePath,
+        writeDocumentView(current.content, current.viewOverrides),
+      );
+      if (!request) {
+        setSaveState(current.dirty ? 'pending' : 'saved');
+        return;
+      }
+      await activateOpenedDocument(request, { skipSave: true });
+      setToast('已另存为新文件');
+    } catch (error) {
+      setSaveState('error');
+      setToast(error.message || '无法另存为该文件。');
+    } finally {
+      saveAsActiveRef.current = false;
+    }
+  }
+
+  async function revealActiveDocument() {
+    const current = documentRef.current;
+    const currentVault = vaultRef.current;
+    if (!current || !currentVault || !desktop?.reveal) return;
+    try {
+      await desktop.reveal(currentVault.rootPath, current.relativePath);
+    } catch (error) {
+      setToast(error.message || '无法在资源管理器中显示该文件。');
+    }
+  }
+
+  async function openDefaultAppSettings() {
+    if (!desktop?.openDefaultAppSettings) return;
+    try {
+      await desktop.openDefaultAppSettings();
+      setToast('请在 Windows 设置中将 Inkspace 设为 .md 的默认应用。');
+    } catch (error) {
+      setToast(error.message || '无法打开 Windows 默认应用设置。');
+    }
+  }
+
+  async function finishCloseRequest() {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    const saved = await flushPendingDocument();
+    if (saved) {
+      await desktop?.completeClose?.();
+      return;
+    }
+    closingRef.current = false;
+    setToast('保存失败，窗口未关闭。请修正后再试。');
+  }
+
   async function revealNode(node) {
     if (!vaultRef.current) return;
     try {
@@ -948,10 +1055,13 @@ function App() {
   }
 
   const commandItems = [
+    { label: 'Open file', detail: 'Choose a local Markdown document', icon: FileText, action: openFile },
     { label: 'Open folder', detail: 'Choose a local Markdown library', icon: FolderOpen, action: openVault },
     { label: 'New note', detail: 'Create a Markdown file', icon: FilePlus2, action: () => openNameDialog('new-file', selectedFolder || parentPath(activeDocument?.relativePath)) },
     { label: 'New folder', detail: 'Create a folder in the library', icon: FolderPlus, action: () => openNameDialog('new-folder', selectedFolder || parentPath(activeDocument?.relativePath)) },
     { label: 'Save note', detail: 'Write changes to disk', icon: Save, action: saveCurrentDocument },
+    { label: 'Save note as', detail: 'Write a copy to another path', icon: Save, action: saveDocumentAs },
+    { label: 'Show in Explorer', detail: 'Reveal the current file', icon: Folder, action: revealActiveDocument },
     { label: 'Export Markdown', detail: 'Save a local Markdown copy', icon: Download, action: () => exportActiveDocument('md') },
     { label: 'Export HTML', detail: 'Save a local HTML document', icon: Download, action: () => exportActiveDocument('html') },
     { label: 'Export PDF', detail: 'Save a local PDF document', icon: Download, action: () => exportActiveDocument('pdf') },
@@ -963,9 +1073,10 @@ function App() {
   return (
     <div className={classNames('desktop-app', 'font-' + activeView.font, 'text-' + activeView.textSize, 'width-' + activeView.lineWidth, !preferences.sidebarOpen && 'sidebar-collapsed', inspectorOpen && 'inspector-visible')}>
       <aside className='ribbon' aria-label='工作区控制'>
-        <button className='ribbon-mark' type='button' onClick={openVault} title='打开本地文件夹' aria-label='打开本地文件夹'>I</button>
+        <button className='ribbon-mark' type='button' onClick={openFile} title='打开 Markdown 文件' aria-label='打开 Markdown 文件'>I</button>
         <div className='ribbon-actions'>
-          <button className='ribbon-button active' type='button' onClick={openVault} title='打开文件夹' aria-label='打开文件夹'><FolderOpen size={19} /></button>
+          <button className='ribbon-button active' type='button' onClick={openFile} title='打开 Markdown 文件' aria-label='打开 Markdown 文件'><FileText size={19} /></button>
+          <button className='ribbon-button' type='button' onClick={openVault} title='打开文件夹' aria-label='打开文件夹'><FolderOpen size={19} /></button>
           <button className='ribbon-button' type='button' onClick={() => openNameDialog('new-file', selectedFolder || parentPath(activeDocument?.relativePath))} title='新建页面' aria-label='新建页面'><FilePlus2 size={19} /></button>
           <button className='ribbon-button' type='button' onClick={() => setSearchOpen((open) => !open)} title='搜索文件' aria-label='搜索文件'><Search size={19} /></button>
           <button className='ribbon-button' type='button' onClick={() => updatePreferences({ sidebarOpen: !preferences.sidebarOpen })} title={preferences.sidebarOpen ? '收起侧栏' : '展开侧栏'} aria-label={preferences.sidebarOpen ? '收起侧栏' : '展开侧栏'}>{preferences.sidebarOpen ? <PanelLeftClose size={19} /> : <PanelLeftOpen size={19} />}</button>
@@ -976,7 +1087,7 @@ function App() {
 
       <aside className='vault-panel'>
         <div className='vault-heading'>
-          <button className='vault-name' type='button' onClick={openVault} title={vault?.rootPath || '打开本地文件夹'}>
+          <button className='vault-name' type='button' onClick={openFile} title={vault?.rootPath || '打开 Markdown 文件'}>
             <FolderOpen size={17} />
             <span>{vault?.tree?.name || '未打开文件夹'}</span>
             <ChevronDown size={15} />
@@ -984,7 +1095,7 @@ function App() {
           <button className='tree-action' type='button' onClick={() => openNameDialog('new-file', selectedFolder || parentPath(activeDocument?.relativePath))} title='新建页面' aria-label='新建页面'><FilePlus2 size={16} /></button>
           <button className='tree-action' type='button' onClick={() => openNameDialog('new-folder', selectedFolder || parentPath(activeDocument?.relativePath))} title='新建文件夹' aria-label='新建文件夹'><FolderPlus size={16} /></button>
         </div>
-        <div className='vault-path' title={vault?.rootPath || ''}>{vault?.rootPath || '选择一个文件夹开始'}</div>
+        <div className='vault-path' title={vault?.rootPath || ''}>{vault?.rootPath || '选择一个 Markdown 文件或文件夹开始'}</div>
         <div className='file-search'>
           <Search size={15} />
           <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder='筛选页面' aria-label='筛选页面' />
@@ -1002,8 +1113,6 @@ function App() {
               nodeMenu={nodeMenu}
               onToggleFolder={toggleFolder}
               onOpenFile={openDocument}
-              previewPath={sidebarPreview?.relativePath}
-              onPreviewFile={previewSidebarPage}
               onOpenMenu={(node) => setNodeMenu((current) => current?.relativePath === node.relativePath ? null : node)}
               onCreateFile={(folderPath) => openNameDialog('new-file', folderPath)}
               onCreateFolder={(folderPath) => openNameDialog('new-folder', folderPath)}
@@ -1013,10 +1122,9 @@ function App() {
               onReveal={revealNode}
             />
           ) : (
-            <div className='empty-tree'><FolderSearch size={22} /><p>{vault ? '没有匹配的 Markdown 页面。' : '打开本地文件夹后，这里会显示 Markdown 页面。'}</p><button type='button' onClick={openVault}>打开文件夹</button></div>
+            <div className='empty-tree'><FolderSearch size={22} /><p>{vault ? '没有匹配的 Markdown 页面。' : '打开 Markdown 文件或文件夹后，这里会显示同目录页面。'}</p><button type='button' onClick={openFile}>打开 Markdown 文件</button></div>
           )}
         </div>
-        {sidebarPreview && <SidebarPreview preview={sidebarPreview} markdown={sidebarPreviewMarkdown} onClose={() => setSidebarPreview(null)} />}
         <div className='vault-footer'>
           <button type='button' onClick={refreshVault} title='刷新文件夹'><RefreshCw size={14} /> 刷新</button>
           {vault && <button type='button' onClick={() => desktop.reveal(vault.rootPath, '')} title='在资源管理器中显示'><Folder size={14} /> 显示</button>}
@@ -1033,6 +1141,8 @@ function App() {
                 <ModeSwitch mode={mode} onChange={setMode} />
                 <DocumentAppearanceControls view={activeView} onChange={updateDocumentView} />
                 <button className='top-icon' type='button' onClick={saveCurrentDocument} title='立即保存' aria-label='立即保存'><Save size={17} /></button>
+                <button className='top-icon' type='button' onClick={saveDocumentAs} title='另存为' aria-label='另存为'><Copy size={17} /></button>
+                <button className='top-icon' type='button' onClick={revealActiveDocument} title='在资源管理器中显示' aria-label='在资源管理器中显示'><FolderOpen size={17} /></button>
                 <div className='export-control'><button className='top-icon' type='button' onClick={() => setExportMenuOpen((open) => !open)} title='导出文档' aria-label='导出文档'><Download size={17} /></button>{exportMenuOpen && <div className='export-menu'><button type='button' onClick={() => exportActiveDocument('md')}>Markdown (.md)</button><button type='button' onClick={() => exportActiveDocument('html')}>HTML (.html)</button><button type='button' onClick={() => exportActiveDocument('pdf')}>PDF (.pdf)</button></div>}</div>
                 <button className='top-icon' type='button' onClick={() => setInspectorOpen((open) => !open)} title={inspectorOpen ? '隐藏大纲' : '显示大纲'} aria-label={inspectorOpen ? '隐藏大纲' : '显示大纲'}>{inspectorOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}</button>
               </div>
@@ -1069,7 +1179,7 @@ function App() {
             </section>
           </>
         ) : (
-          <WelcomeScreen preferences={preferences} onOpenVault={openVault} onOpenRecent={openRecentVault} />
+          <WelcomeScreen preferences={preferences} onOpenFile={openFile} onOpenVault={openVault} onOpenRecent={openRecentVault} onOpenDefaultAppSettings={openDefaultAppSettings} />
         )}
       </main>
 
@@ -1094,21 +1204,22 @@ function DesktopRequired() {
   );
 }
 
-function WelcomeScreen({ preferences, onOpenVault, onOpenRecent }) {
+function WelcomeScreen({ preferences, onOpenFile, onOpenVault, onOpenRecent, onOpenDefaultAppSettings }) {
   return (
     <section className='welcome-screen'>
       <div className='welcome-symbol'>I</div>
-      <h1>本地 Markdown，直接保存在磁盘。</h1>
-      <p>选择一个文件夹后，Inkspace 会直接读写其中的 Markdown 文件，不会上传或同步内容。</p>
-      <button className='primary-command' type='button' onClick={onOpenVault}><FolderOpen size={18} /> 打开本地文件夹</button>
+      <h1>本地 Markdown，直接编辑并保存。</h1>
+      <p>打开单个 Markdown 文件或文件夹后，Inkspace 会直接读写磁盘上的原文件，不会上传或同步内容。</p>
+      <div className='welcome-actions'><button className='primary-command' type='button' onClick={onOpenFile}><FileText size={18} /> 打开 Markdown 文件</button><button className='secondary-command' type='button' onClick={onOpenVault}><FolderOpen size={18} /> 打开文件夹</button></div>
+      <button className='default-app-link' type='button' onClick={onOpenDefaultAppSettings}>将 Inkspace 设为 Markdown 默认应用</button>
       {preferences.recentVaults?.length > 0 && <div className='recent-vaults'><h2>最近打开的文件夹</h2>{preferences.recentVaults.map((rootPath) => <button key={rootPath} type='button' onClick={() => onOpenRecent(rootPath)}><Folder size={16} /><span>{rootPath}</span></button>)}</div>}
     </section>
   );
 }
 
-function VaultTree({ node, depth, expandedFolders, forceExpanded, activePath, selectedFolder, nodeMenu, previewPath, onToggleFolder, onOpenFile, onPreviewFile, onOpenMenu, onCreateFile, onCreateFolder, onCreateSubpage, onRename, onDelete, onReveal }) {
+function VaultTree({ node, depth, expandedFolders, forceExpanded, activePath, selectedFolder, nodeMenu, onToggleFolder, onOpenFile, onOpenMenu, onCreateFile, onCreateFolder, onCreateSubpage, onRename, onDelete, onReveal }) {
   if (node.kind === 'file') {
-    return <div className='tree-page-branch'><FileRow node={node} depth={depth} activePath={activePath} previewPath={previewPath} nodeMenu={nodeMenu} onOpenFile={onOpenFile} onPreviewFile={onPreviewFile} onOpenMenu={onOpenMenu} onCreateSubpage={onCreateSubpage} onRename={onRename} onDelete={onDelete} onReveal={onReveal} />{node.children?.length > 0 && <div className='tree-children page-children'>{node.children.map((child) => <VaultTree key={child.relativePath} node={child} depth={depth + 1} expandedFolders={expandedFolders} forceExpanded={forceExpanded} activePath={activePath} selectedFolder={selectedFolder} nodeMenu={nodeMenu} previewPath={previewPath} onToggleFolder={onToggleFolder} onOpenFile={onOpenFile} onPreviewFile={onPreviewFile} onOpenMenu={onOpenMenu} onCreateFile={onCreateFile} onCreateFolder={onCreateFolder} onCreateSubpage={onCreateSubpage} onRename={onRename} onDelete={onDelete} onReveal={onReveal} />)}</div>}</div>;
+    return <div className='tree-page-branch'><FileRow node={node} depth={depth} activePath={activePath} nodeMenu={nodeMenu} onOpenFile={onOpenFile} onOpenMenu={onOpenMenu} onCreateSubpage={onCreateSubpage} onRename={onRename} onDelete={onDelete} onReveal={onReveal} />{node.children?.length > 0 && <div className='tree-children page-children'>{node.children.map((child) => <VaultTree key={child.relativePath} node={child} depth={depth + 1} expandedFolders={expandedFolders} forceExpanded={forceExpanded} activePath={activePath} selectedFolder={selectedFolder} nodeMenu={nodeMenu} onToggleFolder={onToggleFolder} onOpenFile={onOpenFile} onOpenMenu={onOpenMenu} onCreateFile={onCreateFile} onCreateFolder={onCreateFolder} onCreateSubpage={onCreateSubpage} onRename={onRename} onDelete={onDelete} onReveal={onReveal} />)}</div>}</div>;
   }
 
   const isRoot = !node.relativePath;
@@ -1124,14 +1235,14 @@ function VaultTree({ node, depth, expandedFolders, forceExpanded, activePath, se
         <button className='tree-more' type='button' onClick={(event) => { event.stopPropagation(); onOpenMenu(node); }} title='Folder actions' aria-label='Folder actions'><MoreHorizontal size={15} /></button>
         {nodeMenu?.relativePath === node.relativePath && <NodeMenu node={node} onNewFile={() => onCreateFile(node.relativePath)} onNewFolder={() => onCreateFolder(node.relativePath)} onNewSubpage={() => onCreateSubpage(node)} onRename={() => onRename(node)} onDelete={() => onDelete(node)} onReveal={() => onReveal(node)} />}
       </div>}
-      {expanded && <div className='tree-children'>{(node.children || []).map((child) => <VaultTree key={child.relativePath} node={child} depth={isRoot ? depth : depth + 1} expandedFolders={expandedFolders} forceExpanded={forceExpanded} activePath={activePath} selectedFolder={selectedFolder} nodeMenu={nodeMenu} previewPath={previewPath} onToggleFolder={onToggleFolder} onOpenFile={onOpenFile} onPreviewFile={onPreviewFile} onOpenMenu={onOpenMenu} onCreateFile={onCreateFile} onCreateFolder={onCreateFolder} onCreateSubpage={onCreateSubpage} onRename={onRename} onDelete={onDelete} onReveal={onReveal} />)}</div>}
+      {expanded && <div className='tree-children'>{(node.children || []).map((child) => <VaultTree key={child.relativePath} node={child} depth={isRoot ? depth : depth + 1} expandedFolders={expandedFolders} forceExpanded={forceExpanded} activePath={activePath} selectedFolder={selectedFolder} nodeMenu={nodeMenu} onToggleFolder={onToggleFolder} onOpenFile={onOpenFile} onOpenMenu={onOpenMenu} onCreateFile={onCreateFile} onCreateFolder={onCreateFolder} onCreateSubpage={onCreateSubpage} onRename={onRename} onDelete={onDelete} onReveal={onReveal} />)}</div>}
     </div>
   );
 }
 
-function FileRow({ node, depth, activePath, previewPath, nodeMenu, onOpenFile, onPreviewFile, onOpenMenu, onCreateSubpage, onRename, onDelete, onReveal }) {
+function FileRow({ node, depth, activePath, nodeMenu, onOpenFile, onOpenMenu, onCreateSubpage, onRename, onDelete, onReveal }) {
   return (
-    <div className={classNames('tree-row', 'file-row', activePath === node.relativePath && 'active', previewPath === node.relativePath && 'previewing')} style={{ '--depth': depth }} onMouseEnter={() => onPreviewFile?.(node)} onFocus={() => onPreviewFile?.(node)}>
+    <div className={classNames('tree-row', 'file-row', activePath === node.relativePath && 'active')} style={{ '--depth': depth }}>
       <button className='tree-main file-main' type='button' onClick={() => onOpenFile(node.relativePath)}><FileText size={15} /><span>{fileStem(node.name)}</span></button>
       <button className='tree-more' type='button' onClick={(event) => { event.stopPropagation(); onOpenMenu(node); }} title='File actions' aria-label='File actions'><MoreHorizontal size={15} /></button>
       {nodeMenu?.relativePath === node.relativePath && <NodeMenu node={node} onNewSubpage={() => onCreateSubpage(node)} onRename={() => onRename(node)} onDelete={() => onDelete(node)} onReveal={() => onReveal(node)} />}
@@ -1237,15 +1348,6 @@ function SubpageList({ pages, onOpen, onCreate }) {
       <div className='subpage-heading'><span>子页面</span>{onCreate && <button className='subpage-create' type='button' onClick={onCreate}><FilePlus2 size={15} /> 新建子页面</button>}</div>
       {pages.length > 0 && <div className='subpage-list'>{pages.map((page) => <button className='subpage-card' key={page.relativePath} type='button' onClick={() => onOpen(page.relativePath)}><FileText size={18} /><span><strong>{fileStem(page.name)}</strong><small>{page.children?.length ? `${page.children.length} 个子页面` : '点击打开'}</small></span><ChevronRight size={16} /></button>)}</div>}
     </section>
-  );
-}
-
-function SidebarPreview({ preview, markdown, onClose }) {
-  return (
-    <aside className='sidebar-preview' role='dialog' aria-label={`${preview.title} 页面预览`}>
-      <header className='sidebar-preview-header'><span><Eye size={15} /> 页面预览</span><button className='top-icon' type='button' onClick={onClose} title='关闭预览' aria-label='关闭预览'><X size={15} /></button></header>
-      {preview.loading ? <div className='sidebar-preview-loading'>正在生成预览...</div> : <div className='sidebar-preview-body'><div className='sidebar-preview-title'><FileText size={16} /><span>{preview.title}</span></div><div className='sidebar-preview-meta'>{formatDate(preview.modifiedAt)} · {Math.max(1, Math.ceil((preview.size || 0) / 1024))} KB</div><PreviewSurface markdown={markdown} /></div>}
-    </aside>
   );
 }
 

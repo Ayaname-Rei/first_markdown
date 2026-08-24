@@ -270,7 +270,6 @@ select:focus-visible {
 
 .tree-row.active { background: var(--accent-soft); }
 .tree-row.selected:not(.active) { background: var(--panel-raised); }
-.tree-row.previewing:not(.active) { box-shadow: inset 2px 0 0 var(--accent); background: var(--panel-raised); }
 
 .tree-main {
   min-width: 0;
@@ -363,6 +362,39 @@ select:focus-visible {
 
 .empty-tree button:hover,
 .primary-command:hover { background: #111111; }
+
+.welcome-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.secondary-command {
+  min-height: 33px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--paper);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.secondary-command:hover { color: var(--ink); background: var(--panel-raised); }
+.default-app-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  margin-top: 12px;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.default-app-link:hover { color: var(--accent); }
 
 .vault-footer {
   display: flex;
@@ -677,22 +709,6 @@ select:focus-visible {
 .subpage-card strong { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .subpage-card small { color: var(--subtle); font-size: 11px; }
 
-.sidebar-preview { position: absolute; z-index: 45; top: 92px; left: calc(100% + 10px); width: min(338px, calc(100vw - 350px)); max-height: min(560px, calc(100vh - 118px)); overflow: auto; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--paper-raised); box-shadow: var(--shadow); animation: preview-in 140ms ease both; }
-.sidebar-preview-header { min-height: 40px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 8px 0 11px; border-bottom: 1px solid var(--line); }
-.sidebar-preview-header > span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
-.sidebar-preview-header .top-icon { width: 26px; height: 26px; }
-.sidebar-preview-loading { padding: 20px 13px; color: var(--subtle); font-size: 12px; }
-.sidebar-preview-body { padding: 13px 14px 16px; }
-.sidebar-preview-title { display: flex; align-items: center; gap: 7px; color: var(--ink); font-size: 13px; font-weight: 650; }
-.sidebar-preview-title svg { color: var(--subtle); }
-.sidebar-preview-meta { margin: 5px 0 13px 23px; color: var(--subtle); font-size: 10px; }
-.sidebar-preview-body .markdown-preview { min-height: 0; color: var(--muted); font-size: 12px; line-height: 1.62; }
-.sidebar-preview-body .markdown-preview h1 { font-size: 1.35em; }
-.sidebar-preview-body .markdown-preview h2 { font-size: 1.18em; }
-.sidebar-preview-body .markdown-preview h3 { font-size: 1.05em; }
-.sidebar-preview-body .markdown-preview pre { max-height: 150px; padding: 9px; }
-.sidebar-preview-body .math-block { margin: 0.9em 0; padding: 0.55em; }
-
 .slash-menu {
   position: absolute;
   z-index: 10;
@@ -818,8 +834,6 @@ select:focus-visible {
 @keyframes document-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes menu-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes preview-in { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: translateX(0); } }
-
 .overlay { animation: overlay-in 130ms ease both; }
 .node-menu,
 .export-menu,

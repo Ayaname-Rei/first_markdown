@@ -16,9 +16,28 @@ const DEFAULT_PREFERENCES = {
 };
 
 let mainWindow;
+let rendererReady = false;
+let closeApproved = false;
+let nextOpenDocumentRequestId = 0;
+const pendingOpenDocuments = [];
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 
 function isMarkdownPath(filePath) {
   return /\.(md|markdown)$/i.test(filePath);
+}
+
+function markdownPathsFromCommandLine(commandLine) {
+  if (!Array.isArray(commandLine)) return [];
+  const paths = new Set();
+
+  for (const argument of commandLine) {
+    if (typeof argument !== 'string' || argument.startsWith('-') || !isMarkdownPath(argument)) continue;
+    paths.add(path.resolve(argument));
+  }
+
+  return [...paths];
 }
 
 function pageChildrenFolder(filePath) {
@@ -56,7 +75,8 @@ function resolveInVault(rootPath, relativePath = '') {
   if (typeof relativePath !== 'string') throw new Error('Invalid file path.');
 
   const resolved = path.resolve(root, relativePath);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+  const pathFromRoot = path.relative(root, resolved);
+  if (pathFromRoot === '..' || pathFromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(pathFromRoot)) {
     throw new Error('The requested path is outside the open folder.');
   }
 
@@ -204,6 +224,56 @@ async function openRecentVault(rootPath) {
   allowedRoots.add(root);
   await rememberVault(root);
   return getVault(root);
+}
+
+async function prepareDocumentOpen(filePath) {
+  if (typeof filePath !== 'string' || !filePath) throw new Error('Choose a Markdown file to open.');
+  const requestedPath = path.resolve(filePath);
+  if (!isMarkdownPath(requestedPath)) throw new Error('Only Markdown files can be opened.');
+
+  const stats = await fs.stat(requestedPath);
+  if (!stats.isFile()) throw new Error('The selected item is not a file.');
+
+  const absolutePath = await fs.realpath(requestedPath);
+  const rootPath = path.dirname(absolutePath);
+  allowedRoots.add(rootPath);
+  await rememberVault(rootPath);
+
+  return {
+    vault: await getVault(rootPath),
+    relativePath: relativeToVault(rootPath, absolutePath),
+  };
+}
+
+async function openDocumentDialog() {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Open Markdown file',
+    properties: ['openFile'],
+    filters: [{ name: 'Markdown', extensions: ['md', 'markdown'] }],
+  });
+
+  if (result.canceled || !result.filePaths[0]) return null;
+  return prepareDocumentOpen(result.filePaths[0]);
+}
+
+async function saveDocumentAs(rootPath, relativePath, content) {
+  const sourcePath = resolveInVault(rootPath, relativePath);
+  if (!isMarkdownPath(sourcePath)) throw new Error('Only Markdown files can be saved.');
+  if (typeof content !== 'string') throw new Error('Document content must be text.');
+
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save Markdown As',
+    defaultPath: sourcePath,
+    filters: [{ name: 'Markdown', extensions: ['md', 'markdown'] }],
+    properties: ['showOverwriteConfirmation'],
+  });
+
+  if (result.canceled || !result.filePath) return null;
+  const destination = path.resolve(result.filePath);
+  if (!isMarkdownPath(destination)) throw new Error('Use a .md or .markdown filename.');
+
+  await fs.writeFile(destination, content, 'utf8');
+  return prepareDocumentOpen(destination);
 }
 
 async function readDocument(rootPath, relativePath) {
@@ -406,8 +476,47 @@ async function exportDocument(request) {
   return exportPdf(payload.name, payload.title, payload.html);
 }
 
-function sendCommand(command) {
-  mainWindow?.webContents.send('inkspace:command', command);
+function sendCommand(command, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('inkspace:command', command, payload);
+}
+
+function sendOpenDocument(request) {
+  if (rendererReady && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('inkspace:open-document', request);
+    return;
+  }
+  pendingOpenDocuments.push(request);
+}
+
+async function queueOpenDocument(filePath) {
+  try {
+    const request = {
+      id: ++nextOpenDocumentRequestId,
+      ...(await prepareDocumentOpen(filePath)),
+    };
+    sendOpenDocument(request);
+  } catch (error) {
+    if (rendererReady) sendCommand('open-document-error', error.message || 'Could not open this file.');
+  }
+}
+
+function queueMarkdownPaths(commandLine) {
+  for (const filePath of markdownPathsFromCommandLine(commandLine)) {
+    void queueOpenDocument(filePath);
+  }
+}
+
+async function openDefaultAppSettings() {
+  if (process.platform !== 'win32') throw new Error('Default app settings are only available on Windows.');
+  await shell.openExternal('ms-settings:defaultapps');
+  return true;
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 function createApplicationMenu() {
@@ -415,13 +524,20 @@ function createApplicationMenu() {
     {
       label: '文件',
       submenu: [
-        { label: '打开文件夹...', accelerator: 'Ctrl+O', click: () => sendCommand('open-folder') },
+        { label: '打开 Markdown 文件...', accelerator: 'Ctrl+O', click: () => sendCommand('open-file') },
+        { label: '打开文件夹...', accelerator: 'Ctrl+Shift+O', click: () => sendCommand('open-folder') },
         { label: '新建页面', accelerator: 'Ctrl+N', click: () => sendCommand('new-note') },
         { label: '新建文件夹', accelerator: 'Ctrl+Shift+N', click: () => sendCommand('new-folder') },
+        { type: 'separator' },
+        { label: '保存', accelerator: 'Ctrl+S', click: () => sendCommand('save') },
+        { label: '另存为...', accelerator: 'Ctrl+Shift+S', click: () => sendCommand('save-as') },
+        { label: '在资源管理器中显示', click: () => sendCommand('reveal-active-document') },
         { type: 'separator' },
         { label: '导出 Markdown...', accelerator: 'Ctrl+Shift+E', click: () => sendCommand('export-markdown') },
         { label: '导出 HTML...', click: () => sendCommand('export-html') },
         { label: '导出 PDF...', click: () => sendCommand('export-pdf') },
+        { type: 'separator' },
+        { label: '设置 Markdown 默认应用...', click: () => sendCommand('open-default-app-settings') },
         { type: 'separator' },
         { role: 'close' },
       ],
@@ -460,16 +576,40 @@ function createWindow() {
     },
   });
 
+  closeApproved = false;
   mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.webContents.on('did-start-loading', () => {
+    rendererReady = false;
+  });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (url !== entryUrl) event.preventDefault();
   });
   mainWindow.webContents.on('will-redirect', (event) => event.preventDefault());
+  mainWindow.on('close', (event) => {
+    if (closeApproved || !rendererReady) return;
+    event.preventDefault();
+    mainWindow.webContents.send('inkspace:request-close');
+  });
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    rendererReady = false;
+  });
   mainWindow.loadFile(entryPath);
 }
 
-app.whenReady().then(() => {
+app.on('second-instance', (_event, commandLine) => {
+  focusMainWindow();
+  queueMarkdownPaths(commandLine);
+});
+
+app.on('open-file', (event, filePath) => {
+  event.preventDefault();
+  void queueOpenDocument(filePath);
+});
+
+if (hasSingleInstanceLock) app.whenReady().then(() => {
+  if (process.platform === 'win32') app.setAppUserModelId('com.inkspace.local');
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
   session.defaultSession.webRequest.onBeforeRequest(
     { urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] },
@@ -480,18 +620,34 @@ app.whenReady().then(() => {
   ipcMain.handle('vault:select', openVaultDialog);
   ipcMain.handle('vault:open-recent', (_event, rootPath) => openRecentVault(rootPath));
   ipcMain.handle('vault:list', (_event, rootPath) => getVault(rootPath));
+  ipcMain.handle('document:select', openDocumentDialog);
   ipcMain.handle('vault:read-document', (_event, rootPath, relativePath) => readDocument(rootPath, relativePath));
   ipcMain.handle('vault:write-document', (_event, rootPath, relativePath, content) => writeDocument(rootPath, relativePath, content));
+  ipcMain.handle('document:save-as', (_event, rootPath, relativePath, content) => saveDocumentAs(rootPath, relativePath, content));
   ipcMain.handle('vault:create-document', (_event, rootPath, folderPath, name, parentRelativePath) => createDocument(rootPath, folderPath, name, parentRelativePath));
   ipcMain.handle('vault:create-folder', (_event, rootPath, folderPath, name) => createFolder(rootPath, folderPath, name));
   ipcMain.handle('vault:rename-node', (_event, rootPath, relativePath, name) => renameNode(rootPath, relativePath, name));
   ipcMain.handle('vault:delete-node', (_event, rootPath, relativePath) => deleteNode(rootPath, relativePath));
   ipcMain.handle('document:export', (_event, request) => exportDocument(request));
   ipcMain.handle('vault:reveal', (_event, rootPath, relativePath) => shell.showItemInFolder(resolveInVault(rootPath, relativePath)));
+  ipcMain.handle('app:open-default-app-settings', openDefaultAppSettings);
+  ipcMain.handle('app:complete-close', () => {
+    closeApproved = true;
+    mainWindow?.close();
+    return true;
+  });
+  ipcMain.on('app:renderer-ready', () => {
+    rendererReady = true;
+    while (pendingOpenDocuments.length) {
+      const request = pendingOpenDocuments.shift();
+      sendOpenDocument(request);
+    }
+  });
   ipcMain.handle('preferences:get', getPreferences);
   ipcMain.handle('preferences:save', (_event, changes) => savePreferences(changes));
 
   createWindow();
+  queueMarkdownPaths(process.argv);
 });
 
 app.on('window-all-closed', () => {

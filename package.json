@@ -10,7 +10,7 @@
     "desktop": "npm run build && electron .",
     "start": "npm run desktop",
     "preview": "vite preview",
-    "dist:win": "npm run build && electron-builder --win portable"
+    "dist:win": "npm run build && electron-builder --win nsis portable"
   },
   "dependencies": {
     "@tiptap/extension-highlight": "^3.29.2",
@@ -44,7 +44,6 @@
     "productName": "Inkspace",
     "asar": true,
     "compression": "maximum",
-    "electronDist": "node_modules/electron/dist",
     "toolsets": {
       "nsis": "0.0.0"
     },
@@ -63,7 +62,25 @@
       "icon": "build/icon.ico",
       "signExecutable": false,
       "signAndEditExecutable": false,
+      "fileAssociations": [
+        {
+          "ext": [
+            "md",
+            "markdown"
+          ],
+          "name": "Inkspace Markdown Document",
+          "description": "Markdown document",
+          "icon": "icon.ico",
+          "role": "Editor"
+        }
+      ],
       "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
         {
           "target": "portable",
           "arch": [
@@ -72,6 +89,14 @@
         }
       ],
       "artifactName": "Inkspace-${version}-portable.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "perMachine": true,
+      "artifactName": "Inkspace-${version}-setup.${ext}"
     }
   }
 }
