@@ -17,6 +17,7 @@ The following font files are bundled for offline use. They are not fetched from 
 - Noto Sans SC Variable: SIL Open Font License 1.1. [https://github.com/google/fonts/tree/main/ofl/notosanssc](https://github.com/google/fonts/tree/main/ofl/notosanssc)
 - Ma Shan Zheng: SIL Open Font License 1.1. [https://github.com/googlefonts/mashanzheng](https://github.com/googlefonts/mashanzheng)
 - Source Han Serif CN Variable: SIL Open Font License 1.1. [https://github.com/adobe-fonts/source-han-serif](https://github.com/adobe-fonts/source-han-serif)
+- Noto Serif SC Variable: SIL Open Font License 1.1. [https://github.com/google/fonts/tree/main/ofl/notoserifsc](https://github.com/google/fonts/tree/main/ofl/notoserifsc)
 
 The complete SIL Open Font License 1.1 is included at `licenses/SIL-OFL-1.1.txt` in the distributed application.
 
